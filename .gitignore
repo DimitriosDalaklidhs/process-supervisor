@@ -1,0 +1,11 @@
+# Ignore all logs
+logs/*
+!logs/.gitkeep
+
+# Ignore pid files
+*.pid
+/tmp/process-supervisor/*
+
+# Ignore Python cache
+__pycache__/
+*.pyc
