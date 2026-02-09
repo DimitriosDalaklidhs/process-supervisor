@@ -170,4 +170,4 @@ those include:
 
 - exec: "start" error → fixed by explicit command + args
 
-**Permission issues → fixed via chmod at build time**
+**Permission issues, fixed via chmod at build time**
