@@ -11,7 +11,7 @@ The original supervisor runs on bare metal Linux. This repository extends it to 
 
 From a cloud / DevOps perspective, this repository shows:
 
-- Running a **non-trivial workload** (a process supervisor, not a hello-world app)
+- Running a **non-trivial workload** (a process supervisor)
 - Correct **Docker image construction** for process-based workloads
 - **PID 1 semantics** and signal handling
 - Correct use of **ENTRYPOINT vs CMD vs Kubernetes command/args**
