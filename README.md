@@ -171,3 +171,7 @@ those include:
 - exec: "start" error → fixed by explicit command + args
 
 **Permission issues, fixed via chmod at build time**
+---
+## Author
+
+Dimitrios Dalaklidis is an aspiring backend developer with a strong academic foundation in Informatics and hands-on experience spanning systems programming, containerization, and cloud infrastructure. His work reflects a methodical approach to problem-solving, building expertise from foundational Linux systems through Docker containerization to Kubernetes orchestration.His technical background includes low-level system operations in C, object-oriented application design in Java, process supervision and automation in Bash, and Python scripting for service workloads. Recent projects demonstrate practical experience with container lifecycle management, PID 1 signal handling, Kubernetes deployment patterns, and debugging common failure modes in distributed systems—skills developed through deliberate progression from bare metal implementations to cloud-native deployments.His technical interests center on backend system design, infrastructure reliability, and the construction of maintainable, production-ready software. He actively pursues opportunities to expand his expertise through both academically driven projects and independent research, with particular focus on containerized workloads, orchestration platforms, and the operational aspects of deploying resilient systems that adhere to modern DevOps and software engineering principles.
