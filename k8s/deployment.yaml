@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: process-supervisor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: process-supervisor
+  template:
+    metadata:
+      labels:
+        app: process-supervisor
+    spec:
+      containers:
+        - name: process-supervisor
+          image: process-supervisor:local
+          imagePullPolicy: IfNotPresent
+          command: ["/app/supervisor.sh"]
+          args: ["start", "configs/example.conf"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
