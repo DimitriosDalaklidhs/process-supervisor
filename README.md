@@ -115,7 +115,7 @@ docker build -t process-supervisor:local .
 # Kubernetes
 
 
-The Kubernetes Deployment is intentionally simple and readable:
+The Kubernetes Deployment is intentionally simple:
 
 - Uses apps/v1
 
