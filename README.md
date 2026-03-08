@@ -103,5 +103,5 @@ This project went through real failure modes during development:
 
 ## Author
 
-**Dimitrios Dalaklidis** — CS student at the University of Western Macedonia, interested in backend development, systems programming, and cloud infrastructure.  
+**Dimitrios Dalaklidis**: CS student at the University of Western Macedonia, interested in backend development, systems programming, and cloud infrastructure.  
 📧 dalaklidesdemetres@gmail.com
