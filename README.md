@@ -1,6 +1,6 @@
 # Process Supervisor: Docker & Kubernetes
 
-A lightweight process supervisor written in Bash, containerized with Docker and deployed on Kubernetes. Demonstrates process supervision, PID 1 behavior, signal handling, and real-world container debugging.
+A lightweight process supervisor written in Bash, containerized with Docker and deployed on Kubernetes. Demonstrates process supervision, PID 1 behavior, signal handling, and real world container debugging.
 
 ---
 ## What This Project Demonstrates
