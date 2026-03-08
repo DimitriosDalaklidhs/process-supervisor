@@ -3,7 +3,6 @@
 A lightweight process supervisor written in Bash, containerized with Docker and deployed on Kubernetes. Demonstrates process supervision, PID 1 behavior, signal handling, and real-world container debugging.
 
 ---
-
 ## What This Project Demonstrates
 
 - Process supervision and PID 1 semantics in a containerized environment
