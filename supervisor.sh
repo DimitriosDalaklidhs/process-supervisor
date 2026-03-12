@@ -47,7 +47,7 @@ log() {
 }
 
 # ==============================
-# Helper: Config loading
+# Directory Setup Helper
 # ==============================
 
 load_config() {
