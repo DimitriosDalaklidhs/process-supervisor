@@ -37,7 +37,7 @@ process-supervisor/
 
 ## Docker
 
-The Dockerfile is intentionally minimal: slim base image, explicit `bash` install, cache cleanup, and the supervisor running as PID 1. Argument control is left to Kubernetes.
+The Dockerfile is intentionally minimal, not even 10 lines of code: slim base image, explicit `bash` install, cache cleanup, and the supervisor running as PID 1. Argument control is left to Kubernetes.
 
 ```dockerfile
 FROM python:3.12-slim
