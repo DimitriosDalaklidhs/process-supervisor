@@ -94,10 +94,10 @@ kubectl logs -l app=process-supervisor -f
 
 This project went through real failure modes during development:
 
-- `ImagePullBackOff` — fixed by loading the image into kind before deploying
-- `RunContainerError` — fixed by installing missing system dependencies in the Dockerfile
-- `exec: "start"` error — fixed by using explicit `command` + `args` in the Deployment
-- Permission denied — fixed via `chmod` at build time
+- `ImagePullBackOff` : fixed by loading the image into kind before deploying
+- `RunContainerError` : fixed by installing missing system dependencies in the Dockerfile
+- `exec: "start"` error : fixed by using explicit `command` + `args` in the Deployment
+- Permission denied  : fixed via `chmod` at build time
 
 ---
 
