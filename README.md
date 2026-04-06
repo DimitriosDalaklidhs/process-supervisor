@@ -1,5 +1,5 @@
 # Process Supervisor 
-A lightweight process supervisor written in Bash, containerized with Docker, and deployed on Kubernetes. Handles PID 1 semantics, signal propagation, resource watchdogging, and automatic restarts — the same problems real orchestrators solve, built from scratch.
+A lightweight process supervisor written in Bash, containerized with Docker, and deployed on Kubernetes. Handles PID 1 semantics, signal propagation, resource watchdogging, and automatic restarts, the same problems real orchestrators solve, built from scratch.
 
 ---
 
