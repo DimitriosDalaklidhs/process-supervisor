@@ -4,7 +4,7 @@
 ![Bash](https://img.shields.io/badge/Bash-5.0%2B-1f425f?logo=gnubash&logoColor=white)
 ![Kubernetes](https://img.shields.io/badge/Kubernetes-ready-326ce5?logo=kubernetes&logoColor=white)
 
-A lightweight process supervisor written in Bash, containerized with Docker, and deployed on Kubernetes. Handles PID 1 semantics, signal propagation, resource watchdogging, and automatic restarts. Same set of problems real orchestrators solve, built from scratch.
+A lightweight process supervisor written in Bash, containerized with Docker and deployed on Kubernetes. Handles PID 1 semantics, signal propagation, resource watchdogging and automatic restarts. Same set of problems real orchestrators solve, built from scratch.
 
 > Built to understand what Kubernetes, systemd, and supervisord actually do when they manage a process. Bash because the constraints force you to confront PID 1 and signal forwarding directly instead of inheriting them from a runtime.
 
@@ -62,7 +62,7 @@ process-supervisor/
 
 ## Quick Start
 
-**Option A — Local**
+**Option A: Local**
 ```bash
 chmod +x supervisor.sh
 ./supervisor.sh start configs/example.conf
@@ -71,13 +71,13 @@ chmod +x supervisor.sh
 ./supervisor.sh stop configs/example.conf
 ```
 
-**Option B — Docker**
+**Option B: Docker**
 ```bash
 docker build -t process-supervisor:local .
 docker run --rm process-supervisor:local start configs/example.conf
 ```
 
-**Option C — Kubernetes (kind)**
+**Option C: Kubernetes (kind)**
 ```bash
 kind load docker-image process-supervisor:local --name kind
 kubectl apply -k k8s
