@@ -177,6 +177,18 @@ flowchart LR
 
 ---
 
+## Tradeoffs & Limitations
+
+| Limitation | Why | What a production level supervisor does |
+|---|---|---|
+| 1-second restart cooldown | Simple to implement; fine for demo workloads | Exponential backoff (systemd, supervisord) to avoid crash loops eating CPU |
+| CPU% from `ps` is cumulative, not instantaneous | Portable, no `/proc` parsing | Reads `/proc/<pid>/stat` deltas or uses cgroup accounting |
+| Single child per supervisor | Keeps signal handling and PID tracking trivial | Manages process trees with proper reaping (e.g. `tini`, `dumb-init`) |
+| No log rotation by size, only by day | Bash + `date` is enough for the demo | `logrotate` or structured log shippers with size + age policies |
+| Watchdog runs in a subshell, not a separate process group | Avoids `setsid` complexity | Dedicated supervisor process with proper isolation |
+
+---
+
 ## Troubleshooting
 
 | Error | Cause | Fix |
