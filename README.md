@@ -109,7 +109,7 @@ PID_DIR="/tmp/process-supervisor"
 
 ## Docker
 
-Slim base image, explicit `bash` install, cache cleanup, supervisor as PID 1:
+Slim base image, explicit `bash` install, cache cleanup with supervisor as PID 1:
 
 ```dockerfile
 FROM python:3.12-slim
