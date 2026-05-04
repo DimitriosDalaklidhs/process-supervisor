@@ -1,29 +1,30 @@
-# Process Supervisor 
-A lightweight process supervisor written in Bash, containerized with Docker, and deployed on Kubernetes. Handles PID 1 semantics, signal propagation, resource watchdogging, and automatic restarts, the same problems real orchestrators solve, built from scratch.
+# 🛡️ Process Supervisor
+
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Bash](https://img.shields.io/badge/Bash-5.0%2B-1f425f?logo=gnubash&logoColor=white)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-ready-326ce5?logo=kubernetes&logoColor=white)
+
+A lightweight process supervisor written in Bash, containerized with Docker, and deployed on Kubernetes. Handles PID 1 semantics, signal propagation, resource watchdogging, and automatic restarts. Same set of problems real orchestrators solve, built from scratch.
+
+> Built to understand what Kubernetes, systemd, and supervisord actually do when they manage a process. Bash because the constraints force you to confront PID 1 and signal forwarding directly instead of inheriting them from a runtime.
 
 ---
 
-```
-          ┌─────────────────────────────────────┐
-          │         Process Supervisor          │
-          │                                     │
-          │  ┌─────────────┐ ┌───────────────┐  │
-          │  │  Supervisor  │ │   Watchdog    │  │
-          │  │    Loop      │ │  (CPU / MEM)  │  │
-          │  └─────────────┘ └───────────────┘  │
-          │  ┌─────────────┐ ┌───────────────┐  │
-          │  │   Signal    │ │   Restart     │  │
-          │  │  Handling   │ │    Policy     │  │
-          │  └─────────────┘ └───────────────┘  │
-          │  ┌─────────────┐ ┌───────────────┐  │
-          │  │  PID Files  │ │  Structured   │  │
-          │  │  & Status   │ │   Logging     │  │
-          │  └─────────────┘ └───────────────┘  │
-          └─────────────────────────────────────┘
-                         │
-                         ▼
-                   child process
-                  (any executable)
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph supervisor["Process Supervisor"]
+        direction TB
+        loop["Supervisor<br/>Loop"]
+        watchdog["Watchdog<br/>(CPU / MEM)"]
+        signals["Signal<br/>Handling"]
+        restart["Restart<br/>Policy"]
+        pids["PID Files<br/>& Status"]
+        logs["Structured<br/>Logging"]
+    end
+    supervisor --> child["child process<br/>(any executable)"]
+    style child fill:#fff3cd,stroke:#856404,stroke-width:2px
 ```
 
 ---
@@ -61,13 +62,22 @@ process-supervisor/
 
 ## Quick Start
 
-**Option A — Docker**
+**Option A — Local**
+```bash
+chmod +x supervisor.sh
+./supervisor.sh start configs/example.conf
+./supervisor.sh status configs/example.conf
+./supervisor.sh tail configs/example.conf
+./supervisor.sh stop configs/example.conf
+```
+
+**Option B — Docker**
 ```bash
 docker build -t process-supervisor:local .
 docker run --rm process-supervisor:local start configs/example.conf
 ```
 
-**Option B — Kubernetes (kind)**
+**Option C — Kubernetes (kind)**
 ```bash
 kind load docker-image process-supervisor:local --name kind
 kubectl apply -k k8s
@@ -78,15 +88,6 @@ kubectl rollout restart deployment process-supervisor
 ```bash
 kubectl get pods
 kubectl logs -l app=process-supervisor -f
-```
-
-**Option C — Local**
-```bash
-chmod +x supervisor.sh
-./supervisor.sh start configs/example.conf
-./supervisor.sh status configs/example.conf
-./supervisor.sh tail configs/example.conf
-./supervisor.sh stop configs/example.conf
 ```
 
 ---
@@ -108,7 +109,7 @@ PID_DIR="/tmp/process-supervisor"
 
 ## Docker
 
-Intentionally minimal: slim base image, explicit `bash` install, cache cleanup, supervisor as PID 1:
+Slim base image, explicit `bash` install, cache cleanup, supervisor as PID 1:
 
 ```dockerfile
 FROM python:3.12-slim
@@ -137,37 +138,41 @@ args: ["start", "configs/example.conf"]
 ## Architecture Notes
 
 **Request lifecycle**
-```
-start
-  → load config
-  → check for existing supervisor PID
-  → fork child process
-  → write PID files
-  → spawn watchdog (background subshell)
-  → wait for child exit
-  → evaluate restart policy
-  → loop / exit
+
+```mermaid
+flowchart TD
+    A[start] --> B[load config]
+    B --> C{existing<br/>supervisor PID?}
+    C -->|yes| Z[exit: already running]
+    C -->|no| D[fork child process]
+    D --> E[write PID files]
+    E --> F[spawn watchdog<br/>background subshell]
+    F --> G[wait for child exit]
+    G --> H{evaluate<br/>restart policy}
+    H -->|restart| D
+    H -->|exit| I[cleanup PID files]
 ```
 
 **Restart policy state machine**
-```
-              exit code != 0
-on-failure ────────────────────► restart
-                                    │
-              exit code == 0        │
-           ────────────────────► exit
 
-always ────────────────────────► restart (always)
-
-never  ────────────────────────► exit (always)
+```mermaid
+stateDiagram-v2
+    [*] --> Running
+    Running --> Evaluating: child exits
+    Evaluating --> Running: always
+    Evaluating --> Running: on-failure & exit≠0
+    Evaluating --> [*]: on-failure & exit=0
+    Evaluating --> [*]: never
 ```
 
 **Signal propagation**
-```
-SIGTERM → supervisor
-            └─► SIGTERM → child
-            └─► SIGTERM → watchdog
-                              └─► wait + exit
+
+```mermaid
+flowchart LR
+    ext[external<br/>SIGTERM] --> sup[supervisor]
+    sup -->|SIGTERM| child[child<br/>process]
+    sup -->|SIGTERM| wd[watchdog]
+    wd --> done[wait + exit]
 ```
 
 ---
@@ -185,5 +190,5 @@ SIGTERM → supervisor
 
 ## Author
 
-**Dimitrios Dalaklidis**  
+**Dimitrios Dalaklidis**
 📧 dalaklidesdemetres@gmail.com · [LinkedIn](https://www.linkedin.com/in/dimitrios-dalaklidis) · [GitHub](https://github.com/DimitriosDalaklidhs)
