@@ -12,12 +12,39 @@ spec:
       labels:
         app: process-supervisor
     spec:
+      # Longer than STOP_TIMEOUT (10s), so the supervisor's own SIGTERM ->
+      # SIGKILL escalation finishes before the kubelet kills the container.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
       containers:
         - name: process-supervisor
           image: process-supervisor:local
           imagePullPolicy: IfNotPresent
-          command: ["/app/supervisor.sh"]
+          # The image's ENTRYPOINT is /app/supervisor.sh; args replace its CMD.
           args: ["start", "configs/example.conf"]
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # One core, so the watchdog's MAX_CPU_PCT=90 can still be reached.
+              cpu: "1"
+              # Above MAX_MEM_MB=200: the watchdog stops the worker cleanly
+              # before the kernel's OOM killer would.
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            exec:
+              # Exits 0 only while both the supervisor and its child run.
+              command: ["/app/supervisor.sh", "status", "configs/example.conf"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
