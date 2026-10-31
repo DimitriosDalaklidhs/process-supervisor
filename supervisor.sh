@@ -14,8 +14,10 @@ RESTART_POLICY="always"
 MAX_CPU_PCT=0
 MAX_MEM_MB=0
 CHECK_INTERVAL=2
+STOP_TIMEOUT=10
 
 LOG_DIR="./logs"
+LOG_RETENTION_DAYS=7
 PID_DIR="/tmp/process-supervisor"
 
 SUPERVISOR_PID_FILE=""
@@ -23,7 +25,9 @@ CHILD_PID_FILE=""
 
 running=true
 child_pid=""
+child_status=0
 watchdog_pid=""
+current_log_file=""
 
 # ==============================
 # Helper: Logging
@@ -39,32 +43,61 @@ log_file() {
     echo "$LOG_DIR/${NAME}_${date_part}.log"
 }
 
+# Delete daily log files older than LOG_RETENTION_DAYS (0 = keep everything).
+prune_logs() {
+    (( LOG_RETENTION_DAYS > 0 )) || return 0
+    find "$LOG_DIR" -maxdepth 1 -name "${NAME}_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+}
+
 log() {
-    local ts msg
+    local ts file
     ts=$(date +"%Y-%m-%d %H:%M:%S")
-    msg="$*"
-    printf "%s [%s] %s\n" "$ts" "$NAME" "$msg" | tee -a "$(log_file)"
+    file=$(log_file)
+    if [[ "$file" != "$current_log_file" ]]; then
+        # First line of a new day: switch files and drop expired ones.
+        current_log_file="$file"
+        prune_logs
+    fi
+    printf "%s [%s] %s\n" "$ts" "$NAME" "$*" | tee -a "$file"
 }
 
 # ==============================
-# Directory Setup Helper
+# Config Loading
 # ==============================
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "'$1' not found: $2"
+}
 
 load_config() {
     CONFIG_FILE="$1"
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo "Config not found: $CONFIG_FILE" >&2
-        exit 1
+        die "Config not found: $CONFIG_FILE"
     fi
 
     # shellcheck source=/dev/null
     . "$CONFIG_FILE"
 
     if [[ -z "${NAME:-}" || -z "${COMMAND:-}" ]]; then
-        echo "Config must set NAME and COMMAND" >&2
-        exit 1
+        die "Config must set NAME and COMMAND"
     fi
+
+    case "$RESTART_POLICY" in
+        always|on-failure|never) ;;
+        *) die "Invalid RESTART_POLICY '$RESTART_POLICY' (expected always, on-failure or never)" ;;
+    esac
+
+    local var
+    for var in MAX_CPU_PCT MAX_MEM_MB CHECK_INTERVAL STOP_TIMEOUT LOG_RETENTION_DAYS; do
+        [[ "${!var}" =~ ^[0-9]+$ ]] || die "$var must be a whole number, got '${!var}'"
+    done
+    (( CHECK_INTERVAL > 0 )) || die "CHECK_INTERVAL must be at least 1"
 
     SUPERVISOR_PID_FILE="$PID_DIR/${NAME}.supervisor.pid"
     CHILD_PID_FILE="$PID_DIR/${NAME}.child.pid"
@@ -89,23 +122,28 @@ read_pid_file() {
     [[ -f "$file" ]] && cat "$file" 2>/dev/null || echo ""
 }
 
+# The child runs in its own process group whose ID is the child's PID
+# (see start_child). A negative PID makes kill target the whole group.
+group_alive() {
+    [[ -n "$child_pid" ]] && kill -0 -- "-$child_pid" 2>/dev/null
+}
+
+signal_group() {
+    [[ -n "$child_pid" ]] && kill -"$1" -- "-$child_pid" 2>/dev/null
+    return 0
+}
+
 # ==============================
 # Signal Handlers
 # ==============================
 
 on_term() {
-    log "Received termination signal, shutting down supervisor..."
-
+    # Only flip the flag here. The trap makes `wait` in wait_for_child return
+    # early, and wait_for_child then stops the child and waits for it to exit.
+    if $running; then
+        log "Received termination signal, shutting down supervisor..."
+    fi
     running=false
-
-    if [[ -n "$child_pid" ]] && is_alive "$child_pid"; then
-        log "Sending SIGTERM to child PID $child_pid"
-        kill -TERM "$child_pid" 2>/dev/null || true
-    fi
-
-    if [[ -n "$watchdog_pid" ]] && is_alive "$watchdog_pid"; then
-        kill -TERM "$watchdog_pid" 2>/dev/null || true
-    fi
 }
 
 setup_traps() {
@@ -116,36 +154,32 @@ setup_traps() {
 # Resource Monitoring
 # ==============================
 
-get_cpu_pct() {
-    local pid="$1"
-    ps -o %cpu= -p "$pid" 2>/dev/null | awk '{printf "%d\n", $1}'
-}
-
-get_mem_mb() {
-    local pid="$1"
-    ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%d\n", $1/1024}'
+# CPU % and RSS summed over every process in the child's process group,
+# printed as "<cpu_pct> <mem_mb>". ps reports %CPU as an average over each
+# process's lifetime, not its current rate (see README tradeoffs).
+group_usage() {
+    ps -e -o pgid=,%cpu=,rss= 2>/dev/null |
+        awk -v pgid="$child_pid" '$1 == pgid { cpu += $2; rss += $3 }
+                                  END { printf "%d %d\n", cpu, rss / 1024 }'
 }
 
 watchdog_loop() {
-    local pid="$1"
+    local cpu mem reason
 
-    while is_alive "$pid"; do
-        if (( MAX_CPU_PCT > 0 )); then
-            local cpu
-            cpu=$(get_cpu_pct "$pid" || echo 0)
-            if [[ -n "$cpu" ]] && (( cpu > MAX_CPU_PCT )); then
-                log "CPU limit exceeded: ${cpu}%% > ${MAX_CPU_PCT}%%, killing PID $pid"
-                kill -TERM "$pid" 2>/dev/null || true
-            fi
+    while is_alive "$child_pid"; do
+        read -r cpu mem < <(group_usage)
+
+        reason=""
+        if (( MAX_CPU_PCT > 0 && cpu > MAX_CPU_PCT )); then
+            reason="CPU limit exceeded: ${cpu}% > ${MAX_CPU_PCT}%"
+        elif (( MAX_MEM_MB > 0 && mem > MAX_MEM_MB )); then
+            reason="Memory limit exceeded: ${mem}MB > ${MAX_MEM_MB}MB"
         fi
 
-        if (( MAX_MEM_MB > 0 )); then
-            local mem
-            mem=$(get_mem_mb "$pid" || echo 0)
-            if [[ -n "$mem" ]] && (( mem > MAX_MEM_MB )); then
-                log "Memory limit exceeded: ${mem}MB > ${MAX_MEM_MB}MB, killing PID $pid"
-                kill -TERM "$pid" 2>/dev/null || true
-            fi
+        if [[ -n "$reason" ]]; then
+            log "$reason, stopping child PID $child_pid"
+            stop_child
+            return
         fi
 
         sleep "$CHECK_INTERVAL"
@@ -153,8 +187,18 @@ watchdog_loop() {
 }
 
 start_watchdog() {
-    watchdog_loop "$child_pid" &
-    watchdog_pid=$!
+    if (( MAX_CPU_PCT > 0 || MAX_MEM_MB > 0 )); then
+        watchdog_loop &
+        watchdog_pid=$!
+    fi
+}
+
+stop_watchdog() {
+    if [[ -n "$watchdog_pid" ]]; then
+        kill -TERM "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+        watchdog_pid=""
+    fi
 }
 
 # ==============================
@@ -163,7 +207,12 @@ start_watchdog() {
 
 start_child() {
     log "Starting child: $COMMAND"
-    bash -c "$COMMAND" &
+    # setsid gives the child a new session and process group with ID == its
+    # PID, so signal_group reaches every process the command starts. For a
+    # simple command bash execs it and $! is the worker itself; for something
+    # like `python worker.py | tee out.log`, $! is a bash wrapper and the
+    # worker is its child, so signalling only $! would orphan the worker.
+    setsid bash -c "$COMMAND" &
     child_pid=$!
     echo "$child_pid" > "$CHILD_PID_FILE"
     log "Child started with PID $child_pid"
@@ -171,23 +220,55 @@ start_child() {
     start_watchdog
 }
 
+# SIGTERM the child's process group, then SIGKILL whatever is left after
+# STOP_TIMEOUT seconds.
+stop_child() {
+    group_alive || return 0
+
+    log "Sending SIGTERM to child process group $child_pid"
+    signal_group TERM
+
+    # Count 0.2s ticks rather than compare against $SECONDS, which only moves
+    # on whole-second boundaries and would cut the grace period short.
+    local ticks=0
+    while group_alive && (( ticks < STOP_TIMEOUT * 5 )); do
+        sleep 0.2
+        ticks=$(( ticks + 1 ))
+    done
+
+    if group_alive; then
+        log "Child process group $child_pid still running after ${STOP_TIMEOUT}s, sending SIGKILL"
+        signal_group KILL
+    fi
+}
+
+# Runs in the main shell, never in $(...): `wait` only works on children of
+# the current process, and the child belongs to the main shell.
 wait_for_child() {
-    if [[ -z "$child_pid" ]]; then
-        return
-    fi
+    local rc
 
-    wait "$child_pid"
-    local status=$?
+    while :; do
+        $running || stop_child
 
-    if [[ -n "$watchdog_pid" ]] && is_alive "$watchdog_pid"; then
-        kill -TERM "$watchdog_pid" 2>/dev/null || true
-        wait "$watchdog_pid" 2>/dev/null || true
-    fi
+        wait "$child_pid"
+        rc=$?
 
-    log "Child PID $child_pid exited with status $status"
+        # A trapped signal makes `wait` return early (status > 128) while the
+        # child is still running. Loop: stop it, then wait for its real status.
+        if (( rc > 128 )) && is_alive "$child_pid"; then
+            continue
+        fi
+        break
+    done
+    child_status=$rc
+
+    # The child has exited, but processes it started may still be running in
+    # its group. Stop them so a restart never runs two copies side by side.
+    stop_child
+    stop_watchdog
+
+    log "Child PID $child_pid exited with status $child_status"
     rm -f "$CHILD_PID_FILE"
-
-    echo "$status"
 }
 
 should_restart() {
@@ -212,22 +293,26 @@ supervisor_loop() {
     echo "$$" > "$SUPERVISOR_PID_FILE"
     log "Supervisor started with PID $$, policy=$RESTART_POLICY"
 
+    local exit_code=0
+
     while $running; do
         start_child
-        status=$(wait_for_child)
-        [[ "$running" == false ]] && break
+        wait_for_child
+        $running || break
 
-        if should_restart "$status"; then
+        if should_restart "$child_status"; then
             log "Restarting child (policy=$RESTART_POLICY)..."
             sleep 1
         else
-            log "Not restarting child (policy=$RESTART_POLICY, status=$status), exiting."
+            log "Not restarting child (policy=$RESTART_POLICY, status=$child_status), exiting."
+            exit_code=$child_status
             break
         fi
     done
 
     log "Supervisor exiting."
     rm -f "$SUPERVISOR_PID_FILE"
+    return "$exit_code"
 }
 
 # ==============================
@@ -236,6 +321,11 @@ supervisor_loop() {
 
 cmd_start() {
     load_config "$1"
+
+    require_cmd setsid "install util-linux"
+    if (( MAX_CPU_PCT > 0 || MAX_MEM_MB > 0 )); then
+        require_cmd ps "the watchdog needs it; install procps or set MAX_CPU_PCT and MAX_MEM_MB to 0"
+    fi
 
     local existing
     existing=$(read_pid_file "$SUPERVISOR_PID_FILE")
@@ -251,7 +341,7 @@ cmd_start() {
 cmd_stop() {
     load_config "$1"
 
-    local pid
+    local pid cpid
     pid=$(read_pid_file "$SUPERVISOR_PID_FILE")
 
     if [[ -z "$pid" ]] || ! is_alive "$pid"; then
@@ -262,20 +352,33 @@ cmd_stop() {
 
     echo "Stopping supervisor PID $pid for '$NAME'..."
     kill -TERM "$pid" 2>/dev/null || true
-    sleep 1
+
+    # The supervisor gives its child STOP_TIMEOUT seconds before SIGKILL,
+    # so wait a little longer than that before forcing anything.
+    local deadline=$(( SECONDS + STOP_TIMEOUT + 5 ))
+    while is_alive "$pid" && (( SECONDS < deadline )); do
+        sleep 0.5
+    done
 
     if is_alive "$pid"; then
-        echo "Supervisor did not exit, sending SIGKILL..."
+        echo "Supervisor did not exit, sending SIGKILL to it and its child process group..."
+        cpid=$(read_pid_file "$CHILD_PID_FILE")
+        if [[ -n "$cpid" ]]; then
+            kill -KILL -- "-$cpid" 2>/dev/null || true
+        fi
         kill -KILL "$pid" 2>/dev/null || true
+        rm -f "$SUPERVISOR_PID_FILE" "$CHILD_PID_FILE"
     fi
 
-    rm -f "$SUPERVISOR_PID_FILE"
+    echo "Stopped."
 }
 
+# Exit code 0 when both supervisor and child are running, 1 otherwise,
+# so this works as a Kubernetes liveness probe.
 cmd_status() {
     load_config "$1"
 
-    local spid cpid
+    local spid cpid rc=0
     spid=$(read_pid_file "$SUPERVISOR_PID_FILE")
     cpid=$(read_pid_file "$CHILD_PID_FILE")
 
@@ -283,19 +386,22 @@ cmd_status() {
         echo "Supervisor for '$NAME' is running (PID $spid)."
     else
         echo "Supervisor for '$NAME' is NOT running."
+        rc=1
     fi
 
     if [[ -n "$cpid" ]] && is_alive "$cpid"; then
         echo "  Child process running (PID $cpid)."
         if command -v ps >/dev/null 2>&1; then
-            echo "  Resource usage:"
-            ps -p "$cpid" -o pid,ppid,%cpu,%mem,rss,cmd
+            echo "  Process group $cpid:"
+            ps -e -o pid,pgid,%cpu,%mem,rss,cmd | awk -v pgid="$cpid" 'NR == 1 || $2 == pgid'
         fi
     else
         echo "  Child process is NOT running."
+        rc=1
     fi
 
     echo "  Logs: $(log_file)"
+    exit "$rc"
 }
 
 cmd_tail() {
@@ -309,7 +415,7 @@ usage() {
     echo "Commands:"
     echo "  start   <config>  Start supervisor for process defined in config"
     echo "  stop    <config>  Stop supervisor"
-    echo "  status  <config>  Show supervisor/child status"
+    echo "  status  <config>  Show supervisor/child status (exit 0 = both running)"
     echo "  tail    <config>  Tail logs"
     echo
     echo "Example:"
