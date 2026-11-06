@@ -14,7 +14,10 @@ RESTART_POLICY="always"
 MAX_CPU_PCT=0
 MAX_MEM_MB=0
 CHECK_INTERVAL=2
+CPU_SUSTAIN=30
 STOP_TIMEOUT=10
+MAX_RESTART_DELAY=30
+MIN_UPTIME=10
 
 LOG_DIR="./logs"
 LOG_RETENTION_DAYS=7
@@ -22,6 +25,7 @@ PID_DIR="/tmp/process-supervisor"
 
 SUPERVISOR_PID_FILE=""
 CHILD_PID_FILE=""
+LOCK_FILE=""
 
 running=true
 child_pid=""
@@ -44,9 +48,10 @@ log_file() {
 }
 
 # Delete daily log files older than LOG_RETENTION_DAYS (0 = keep everything).
+# The date pattern keeps NAME=api from matching api_v2's files.
 prune_logs() {
     (( LOG_RETENTION_DAYS > 0 )) || return 0
-    find "$LOG_DIR" -maxdepth 1 -name "${NAME}_*.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    find "$LOG_DIR" -maxdepth 1 -name "${NAME}_????-??-??.log" -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 }
 
 log() {
@@ -88,19 +93,25 @@ load_config() {
         die "Config must set NAME and COMMAND"
     fi
 
+    # NAME goes into file names and a find pattern.
+    [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "NAME may only use letters, digits, '.', '_' and '-', got '$NAME'"
+
     case "$RESTART_POLICY" in
         always|on-failure|never) ;;
         *) die "Invalid RESTART_POLICY '$RESTART_POLICY' (expected always, on-failure or never)" ;;
     esac
 
     local var
-    for var in MAX_CPU_PCT MAX_MEM_MB CHECK_INTERVAL STOP_TIMEOUT LOG_RETENTION_DAYS; do
+    for var in MAX_CPU_PCT MAX_MEM_MB CHECK_INTERVAL CPU_SUSTAIN STOP_TIMEOUT \
+               MAX_RESTART_DELAY MIN_UPTIME LOG_RETENTION_DAYS; do
         [[ "${!var}" =~ ^[0-9]+$ ]] || die "$var must be a whole number, got '${!var}'"
     done
     (( CHECK_INTERVAL > 0 )) || die "CHECK_INTERVAL must be at least 1"
+    (( MAX_RESTART_DELAY > 0 )) || die "MAX_RESTART_DELAY must be at least 1"
 
     SUPERVISOR_PID_FILE="$PID_DIR/${NAME}.supervisor.pid"
     CHILD_PID_FILE="$PID_DIR/${NAME}.child.pid"
+    LOCK_FILE="$PID_DIR/${NAME}.lock"
 
     log_init
 }
@@ -120,6 +131,14 @@ is_alive() {
 read_pid_file() {
     local file="$1"
     [[ -f "$file" ]] && cat "$file" 2>/dev/null || echo ""
+}
+
+# True while a supervisor for NAME holds the instance lock (see cmd_start).
+# The kernel releases the lock when that process dies, even on SIGKILL, so
+# unlike the PID file it can't go stale or point at a reused PID.
+supervisor_running() {
+    flock -n -E 75 "$LOCK_FILE" true 2>/dev/null
+    (( $? == 75 ))   # 75: someone else holds it
 }
 
 # The child runs in its own process group whose ID is the child's PID
@@ -150,30 +169,71 @@ setup_traps() {
     trap on_term INT TERM
 }
 
+# Sleep that a trapped SIGTERM/SIGINT cuts short. Bash runs a trap only once
+# the foreground command finishes, but a trap interrupts `wait` immediately.
+interruptible_sleep() {
+    sleep "$1" &
+    local pid=$!
+    wait "$pid"
+    kill "$pid" 2>/dev/null
+}
+
 # ==============================
 # Resource Monitoring
 # ==============================
 
-# CPU % and RSS summed over every process in the child's process group,
-# printed as "<cpu_pct> <mem_mb>". ps reports %CPU as an average over each
-# process's lifetime, not its current rate (see README tradeoffs).
+# Usage summed over every process in the child's process group, printed as
+# "<cpu_ticks> <rss_pages>": CPU time used so far (utime + stime) and
+# resident memory, from /proc/<pid>/stat.
 group_usage() {
-    ps -e -o pgid=,%cpu=,rss= 2>/dev/null |
-        awk -v pgid="$child_pid" '$1 == pgid { cpu += $2; rss += $3 }
-                                  END { printf "%d %d\n", cpu, rss / 1024 }'
+    local f line pgrp utime stime rss ticks=0 pages=0
+    for f in /proc/[0-9]*/stat; do
+        read -r line 2>/dev/null < "$f" || continue   # exited since the glob
+        # Fields after "pid (comm) "; comm itself may contain spaces and ")".
+        read -r _ _ pgrp _ _ _ _ _ _ _ _ utime stime _ _ _ _ _ _ _ _ rss _ <<< "${line##*) }"
+        if [[ "$pgrp" == "$child_pid" ]]; then
+            ticks=$(( ticks + utime + stime ))
+            pages=$(( pages + rss ))
+        fi
+    done
+    echo "$ticks $pages"
 }
 
 watchdog_loop() {
-    local cpu mem reason
+    local hz page_kb ticks pages prev_ticks prev_us now_us cpu mem over=0 reason
+    hz=$(getconf CLK_TCK)
+    page_kb=$(( $(getconf PAGESIZE) / 1024 ))
+
+    read -r prev_ticks _ < <(group_usage)
+    prev_us=${EPOCHREALTIME/[.,]/}
 
     while is_alive "$child_pid"; do
-        read -r cpu mem < <(group_usage)
+        sleep "$CHECK_INTERVAL"
+        read -r ticks pages < <(group_usage)
+        now_us=${EPOCHREALTIME/[.,]/}
+
+        # CPU % over this interval (100 = one core). ps %CPU is a lifetime
+        # average instead: it flags a busy startup and misses a process that
+        # starts spinning after hours of running normally.
+        cpu=$(( (ticks - prev_ticks) * 100000000 / (hz * (now_us - prev_us)) ))
+        (( cpu < 0 )) && cpu=0   # a process left the group since the last sample
+        prev_ticks=$ticks
+        prev_us=$now_us
+        mem=$(( pages * page_kb / 1024 ))
+
+        # CPU must stay over the limit for CPU_SUSTAIN seconds; memory can't
+        # wait, so its limit applies at once.
+        if (( MAX_CPU_PCT > 0 && cpu > MAX_CPU_PCT )); then
+            over=$(( over + CHECK_INTERVAL ))
+        else
+            over=0
+        fi
 
         reason=""
-        if (( MAX_CPU_PCT > 0 && cpu > MAX_CPU_PCT )); then
-            reason="CPU limit exceeded: ${cpu}% > ${MAX_CPU_PCT}%"
-        elif (( MAX_MEM_MB > 0 && mem > MAX_MEM_MB )); then
+        if (( MAX_MEM_MB > 0 && mem > MAX_MEM_MB )); then
             reason="Memory limit exceeded: ${mem}MB > ${MAX_MEM_MB}MB"
+        elif (( over > 0 && over >= CPU_SUSTAIN )); then
+            reason="CPU limit exceeded: ${cpu}% > ${MAX_CPU_PCT}% for ${over}s"
         fi
 
         if [[ -n "$reason" ]]; then
@@ -181,14 +241,12 @@ watchdog_loop() {
             stop_child
             return
         fi
-
-        sleep "$CHECK_INTERVAL"
     done
 }
 
 start_watchdog() {
     if (( MAX_CPU_PCT > 0 || MAX_MEM_MB > 0 )); then
-        watchdog_loop &
+        watchdog_loop 9>&- &
         watchdog_pid=$!
     fi
 }
@@ -212,7 +270,10 @@ start_child() {
     # simple command bash execs it and $! is the worker itself; for something
     # like `python worker.py | tee out.log`, $! is a bash wrapper and the
     # worker is its child, so signalling only $! would orphan the worker.
-    setsid bash -c "$COMMAND" &
+    # env undoes a bash rule: `&` jobs start with SIGINT and SIGQUIT ignored
+    # when job control is off, and the worker would inherit that. 9>&- keeps
+    # the instance lock out of the worker.
+    setsid env --default-signal=INT,QUIT bash -c "$COMMAND" 9>&- &
     child_pid=$!
     echo "$child_pid" > "$CHILD_PID_FILE"
     log "Child started with PID $child_pid"
@@ -293,21 +354,26 @@ supervisor_loop() {
     echo "$$" > "$SUPERVISOR_PID_FILE"
     log "Supervisor started with PID $$, policy=$RESTART_POLICY"
 
-    local exit_code=0
+    local exit_code=0 delay=1 started
 
     while $running; do
+        started=$SECONDS
         start_child
         wait_for_child
         $running || break
 
-        if should_restart "$child_status"; then
-            log "Restarting child (policy=$RESTART_POLICY)..."
-            sleep 1
-        else
+        if ! should_restart "$child_status"; then
             log "Not restarting child (policy=$RESTART_POLICY, status=$child_status), exiting."
             exit_code=$child_status
             break
         fi
+
+        # Exponential backoff while the child keeps dying young, like
+        # Kubernetes' CrashLoopBackOff; a run of MIN_UPTIME seconds resets it.
+        (( SECONDS - started >= MIN_UPTIME )) && delay=1
+        log "Restarting child in ${delay}s (policy=$RESTART_POLICY)..."
+        interruptible_sleep "$delay"
+        delay=$(( delay * 2 < MAX_RESTART_DELAY ? delay * 2 : MAX_RESTART_DELAY ))
     done
 
     log "Supervisor exiting."
@@ -323,15 +389,16 @@ cmd_start() {
     load_config "$1"
 
     require_cmd setsid "install util-linux"
-    if (( MAX_CPU_PCT > 0 || MAX_MEM_MB > 0 )); then
-        require_cmd ps "the watchdog needs it; install procps or set MAX_CPU_PCT and MAX_MEM_MB to 0"
-    fi
+    require_cmd flock "install util-linux"
+    env --default-signal=INT true 2>/dev/null || die "'env --default-signal' not supported: install GNU coreutils"
 
-    local existing
-    existing=$(read_pid_file "$SUPERVISOR_PID_FILE")
-
-    if [[ -n "$existing" ]] && is_alive "$existing"; then
-        echo "Supervisor for '$NAME' already running with PID $existing"
+    # One supervisor per NAME: hold an exclusive lock on fd 9 for the whole
+    # run. A PID file can't do this job: after a SIGKILL it stays behind, and
+    # as PID 1 in a restarted container the new supervisor finds its own PID
+    # in it. -w 1 rides out a `status`, which takes the lock briefly to test it.
+    exec 9> "$LOCK_FILE" || die "Cannot open lock file $LOCK_FILE"
+    if ! flock -w 1 9; then
+        echo "Supervisor for '$NAME' already running with PID $(read_pid_file "$SUPERVISOR_PID_FILE")"
         exit 0
     fi
 
@@ -344,7 +411,9 @@ cmd_stop() {
     local pid cpid
     pid=$(read_pid_file "$SUPERVISOR_PID_FILE")
 
-    if [[ -z "$pid" ]] || ! is_alive "$pid"; then
+    # Trust the PID file only while the lock is held: after a crash it can
+    # name a PID the kernel has since given to an unrelated process.
+    if ! supervisor_running || [[ -z "$pid" ]]; then
         echo "Supervisor for '$NAME' is not running."
         rm -f "$SUPERVISOR_PID_FILE"
         exit 0
@@ -382,7 +451,7 @@ cmd_status() {
     spid=$(read_pid_file "$SUPERVISOR_PID_FILE")
     cpid=$(read_pid_file "$CHILD_PID_FILE")
 
-    if [[ -n "$spid" ]] && is_alive "$spid"; then
+    if supervisor_running && [[ -n "$spid" ]]; then
         echo "Supervisor for '$NAME' is running (PID $spid)."
     else
         echo "Supervisor for '$NAME' is NOT running."
@@ -413,10 +482,10 @@ usage() {
     echo "Usage: $0 <command> <config>"
     echo
     echo "Commands:"
-    echo "  start   <config>  Start supervisor for process defined in config"
+    echo "  start   <config>  Run the supervisor in the foreground for the process in config"
     echo "  stop    <config>  Stop supervisor"
     echo "  status  <config>  Show supervisor/child status (exit 0 = both running)"
-    echo "  tail    <config>  Tail logs"
+    echo "  tail    <config>  Tail the supervisor's log"
     echo
     echo "Example:"
     echo "  $0 start configs/example.conf"
