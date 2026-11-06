@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
-# procps provides `ps` for the watchdog. bash, setsid (util-linux), awk and
-# find are already part of the Debian slim base.
+# procps provides `ps` for the process listing in `status` (the watchdog reads
+# /proc directly). bash, setsid and flock (util-linux), GNU env, awk and find
+# are already part of the Debian slim base.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
  && rm -rf /var/lib/apt/lists/*
