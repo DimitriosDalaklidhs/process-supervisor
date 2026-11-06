@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Behaviour tests for supervisor.sh: restart policies, signal handling,
-# process-group cleanup, the watchdog and config validation.
-# Each test starts a real supervisor against a small Bash child.
+# Behaviour tests for supervisor.sh: restart policies and backoff, signal
+# handling, process-group cleanup, the watchdog, stale PID files, PID 1 and
+# config validation. Each test starts a real supervisor against a small Bash child.
 #
-# Usage:  bash tests/test_supervisor.sh
-# Needs:  Linux, bash, procps (ps/pgrep), util-linux (setsid)
+# Usage:  bash tests/test_supervisor.sh     (as root, it also runs the PID 1 test)
+# Needs:  Linux, bash 5, procps (ps/pgrep), util-linux (setsid, flock, unshare)
 
 # Child scripts below are single-quoted on purpose: they expand when they run.
 # shellcheck disable=SC2016
@@ -79,6 +79,8 @@ now_ms() {
 }
 
 not() { ! "$@"; }
+
+alive() { kill -0 "$1" 2>/dev/null; }
 
 wait_until() {   # wait_until <seconds> <command...>
     local deadline=$(( SECONDS + $1 ))
@@ -201,12 +203,27 @@ check "worker received SIGTERM, not just the bash wrapper" logged "worker: got S
 check "worker is not orphaned" test "$(children)" -eq 0
 
 echo "== watchdog: CPU"
-new_case cpu_hog 'while :; do :; done' 'RESTART_POLICY="never"' 'MAX_CPU_PCT=50'
+new_case cpu_hog 'while :; do :; done' 'RESTART_POLICY="never"' 'MAX_CPU_PCT=50' 'CPU_SUSTAIN=2'
 start_sup
 wait_for_exit 15
 check "CPU limit enforced" logged "CPU limit exceeded"
 check "log shows a single % sign" not logged "%%"
 check "hog is gone" test "$(children)" -eq 0
+
+echo "== watchdog: CPU is measured per interval, not as a lifetime average"
+new_case cpu_startup 'end=$(( SECONDS + 3 )); while (( SECONDS < end )); do :; done
+echo "child: startup done"
+sleep 300' 'MAX_CPU_PCT=50' 'CPU_SUSTAIN=6'
+start_sup
+sleep 8
+check "3s of busy startup is not killed (CPU_SUSTAIN=6)" not logged "CPU limit exceeded"
+check "child got past its startup" logged "child: startup done"
+stop_sup
+
+new_case cpu_late 'sleep 8; while :; do :; done' 'RESTART_POLICY="never"' 'MAX_CPU_PCT=50' 'CPU_SUSTAIN=2'
+start_sup
+wait_for_exit 13
+check "loop that starts after 8s idle is stopped within ~3s" logged "CPU limit exceeded"
 
 echo "== watchdog: memory"
 new_case mem_hog 'x=$(head -c 80000000 /dev/zero | tr "\0" a)
@@ -226,11 +243,9 @@ new_case bad_number 'sleep 300' 'MAX_MEM_MB=200MB'
 timeout 5 bash "$SUP" start "$dir/test.conf" > "$dir/out.log" 2>&1
 check "non-numeric limit is rejected" logged "MAX_MEM_MB must be a whole number"
 
-new_case no_ps 'sleep 300' 'MAX_CPU_PCT=90'
-mkdir -p "$dir/bin"
-for tool in mkdir setsid; do ln -s "$(command -v "$tool")" "$dir/bin/$tool"; done
-PATH="$dir/bin" "$(command -v timeout)" 5 "$(command -v bash)" "$SUP" start "$dir/test.conf" > "$dir/out.log" 2>&1
-check "limits set without ps: refuses to start" logged "'ps' not found"
+new_case bad_name 'sleep 300' 'NAME="../elsewhere"'
+timeout 5 bash "$SUP" start "$dir/test.conf" > "$dir/out.log" 2>&1
+check "NAME with a path separator is rejected" logged "NAME may only use"
 
 echo "== stop and status commands"
 new_case cli 'sleep 300' 'RESTART_POLICY="always"'
@@ -245,6 +260,63 @@ check "stop: supervisor gone" test "$sup_rc" = 0
 check "stop: child group gone" group_empty "$cpid"
 bash "$SUP" status "$dir/test.conf" > /dev/null 2>&1
 check "status exits 1 when stopped" test $? -eq 1
+
+echo "== restart backoff"
+new_case backoff 'exit 1' 'RESTART_POLICY="always"' 'MAX_RESTART_DELAY=4' 'MIN_UPTIME=10'
+start_sup
+sleep 8.5
+check "delay doubles: 1s, 2s, 4s" logged "Restarting child in 4s"
+check "and stops at MAX_RESTART_DELAY=4" not logged "Restarting child in 8s"
+check "no hot loop: at most 4 starts in 8.5s" test "$(grep -c 'Starting child' "$dir/out.log")" -le 4
+t0=$(now_ms)
+stop_sup
+check "SIGTERM during a backoff sleep exits at once (< 1.5s)" test $(( $(now_ms) - t0 )) -lt 1500
+
+echo "== worker signal dispositions"
+# exec: bash ignores SIGQUIT in its own process whatever it inherited, so
+# measure the program it execs.
+new_case signals 'exec sleep 300'
+start_sup
+sleep 1
+ign=$(awk '/^SigIgn/ {print $2}' "/proc/$(child_pid)/status" 2>/dev/null)
+check "worker does not start with SIGINT/SIGQUIT ignored" test $(( 16#${ign:-6} & 6 )) -eq 0
+stop_sup
+
+echo "== stale PID file (supervisor died without cleanup, PID since reused)"
+new_case stale 'sleep 300'
+mkdir -p "$dir/pids"
+sleep 300 &
+bystander=$!
+echo "$bystander" > "$dir/pids/stale.supervisor.pid"
+start_sup
+sleep 1
+check "start is not blocked by it" test "$(children)" -eq 1
+stop_sup
+echo "$bystander" > "$dir/pids/stale.supervisor.pid"
+bash "$SUP" stop "$dir/test.conf" > /dev/null 2>&1
+check "stop does not signal the unrelated process" alive "$bystander"
+kill "$bystander" 2>/dev/null
+
+echo "== PID 1 in a container restarted after SIGKILL"
+if unshare --pid --fork --mount-proc true 2>/dev/null; then
+    new_case pid1 'sleep 300'
+    # First run as PID 1, killed with SIGKILL like `docker kill` or the OOM
+    # killer: no cleanup, so the PID file still says 1.
+    unshare --pid --fork --mount-proc bash "$SUP" start "$dir/test.conf" > "$dir/out.log" 2>&1 &
+    ns=$!
+    sleep 1
+    pkill -KILL -P "$ns"
+    wait "$ns" 2>/dev/null
+    # Same filesystem, new PID 1: what `docker start` or a restart policy does.
+    unshare --pid --fork --mount-proc bash "$SUP" start "$dir/test.conf" >> "$dir/out.log" 2>&1 &
+    ns=$!
+    sleep 1
+    check "restarted supervisor starts its child" test "$(grep -c 'Child started' "$dir/out.log")" -eq 2
+    pkill -TERM -P "$ns"
+    wait "$ns" 2>/dev/null
+else
+    echo "SKIP  needs root to create a PID namespace (unshare --pid)"
+fi
 
 echo
 echo "$passed passed, $failed failed"
